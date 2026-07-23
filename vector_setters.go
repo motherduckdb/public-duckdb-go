@@ -378,23 +378,68 @@ func setMap[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
 	case OrderedMap:
 		m = v
 	case Map:
-		m = OrderedMap{}
+		// Go map keys are unique, so append directly instead of Set: Set's
+		// linear-scan Delete makes the conversion O(n²) in key count for no
+		// benefit here. Iteration order stays Go-map-random, as before.
+		m = OrderedMap{
+			keys:   make([]any, 0, len(v)),
+			values: make([]any, 0, len(v)),
+		}
 		for key, value := range v {
-			m.Set(key, value)
+			m.keys = append(m.keys, key)
+			m.values = append(m.values, value)
 		}
 	default:
 		return castError(reflect.TypeOf(val).String(), reflectTypeMap.String())
 	}
 
-	// Create a LIST of STRUCT values.
-	list := make([]any, m.Len())
-	keys := m.Keys()
-	vals := m.Values()
-	for i := range keys {
-		list[i] = map[string]any{mapKeysField(): keys[i], mapValuesField(): vals[i]}
+	// A MAP vector is a LIST vector whose child is a STRUCT(key, value)
+	// vector. Write each entry directly into the STRUCT's key and value child
+	// vectors instead of materializing a []any of per-entry map[string]any
+	// values for setList/setStruct: that intermediate representation
+	// allocates two objects per entry plus per-entry struct field-name
+	// lookups, which dominates the appender profile for rows with wide MAP
+	// columns. Iterate the OrderedMap's backing slices directly — the Keys()
+	// and Values() accessors return copies.
+	n := m.Len()
+	childOffset := mapping.ListVectorGetSize(vec.vec)
+	listEntry := mapping.NewListEntry(uint64(childOffset), uint64(n))
+	setPrimitive(vec, rowIdx, listEntry)
+	vec.resizeListVector(childOffset + mapping.IdxT(n))
+
+	structVec := &vec.childVectors[0]
+	keyVec, err := structVec.structChildByName(mapKeysField())
+	if err != nil {
+		return err
+	}
+	valueVec, err := structVec.structChildByName(mapValuesField())
+	if err != nil {
+		return err
 	}
 
-	return setList(vec, rowIdx, list)
+	entryIdx := childOffset
+	for i := range m.keys {
+		if err := keyVec.setFn(keyVec, entryIdx, m.keys[i]); err != nil {
+			return err
+		}
+		if err := valueVec.setFn(valueVec, entryIdx, m.values[i]); err != nil {
+			return err
+		}
+		entryIdx++
+	}
+	return nil
+}
+
+// structChildByName returns the child vector holding the STRUCT field with
+// the given name. Used by setMap to resolve the canonical key/value children
+// once per appended map rather than once per entry.
+func (vec *vector) structChildByName(name string) (*vector, error) {
+	for i := range vec.childVectors {
+		if vec.structEntries[i].Name() == name {
+			return &vec.childVectors[i], nil
+		}
+	}
+	return nil, structFieldError("missing field", name)
 }
 
 func setArray[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
