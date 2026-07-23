@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -170,6 +171,40 @@ func BenchmarkAppenderWideMap(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if err := a.AppendRow(int64(i), float64(i), wide); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	if err := a.Flush(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+// BenchmarkAppenderProductionRow approximates the OTel exporter's gauge row:
+// BIGINT id, two TIMESTAMPs, six VARCHAR scalars, a 26-key resource map and a
+// 5-key datapoint map. Ground truth for where appender time goes after the
+// setMap direct-write change.
+func BenchmarkAppenderProductionRow(b *testing.B) {
+	c, db, conn, a := prepareAppender(b, appenderTypeDefault, `CREATE TABLE test (
+		id BIGINT, ts TIMESTAMP, start_ts TIMESTAMP,
+		metric_name VARCHAR, metric_description VARCHAR, metric_unit VARCHAR,
+		service_name VARCHAR, scope_name VARCHAR, scope_version VARCHAR,
+		res_attrs MAP(VARCHAR, VARCHAR), dp_attrs MAP(VARCHAR, VARCHAR))`)
+	defer cleanupAppender(b, c, db, conn, a)
+
+	wide := wideTestMap()
+	dp := Map{
+		"state": "used", "pod": "checkout-6d5f9b7c8-x2x9p",
+		"namespace": "ns-prod-checkout", "container": "server", "device": "/dev/nvme0n1",
+	}
+	ts := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := a.AppendRow(int64(i), ts, ts,
+			"kube_pod_container_resource_requests", "Resource requests by container", "unit",
+			"checkout", "otelcol/prometheusreceiver", "0.154.0",
+			wide, dp); err != nil {
 			b.Fatal(err)
 		}
 	}

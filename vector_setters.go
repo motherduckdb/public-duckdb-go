@@ -220,7 +220,11 @@ func setBignum[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
 func setBytes[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
 	switch v := any(val).(type) {
 	case string:
-		mapping.VectorAssignStringElementLen(vec.vec, rowIdx, []byte(v))
+		// VectorAssignStringElement passes the string's bytes to C directly
+		// (DuckDB copies synchronously); converting through []byte(v) would
+		// allocate and copy once per string, which dominates the appender's
+		// allocation profile for string-heavy rows.
+		mapping.VectorAssignStringElement(vec.vec, rowIdx, v)
 	case []byte:
 		mapping.VectorAssignStringElementLen(vec.vec, rowIdx, v)
 	default:
@@ -372,23 +376,12 @@ func setStruct[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
 }
 
 func setMap[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
-	var m OrderedMap
-
+	var n int
 	switch v := any(val).(type) {
 	case OrderedMap:
-		m = v
+		n = v.Len()
 	case Map:
-		// Go map keys are unique, so append directly instead of Set: Set's
-		// linear-scan Delete makes the conversion O(n²) in key count for no
-		// benefit here. Iteration order stays Go-map-random, as before.
-		m = OrderedMap{
-			keys:   make([]any, 0, len(v)),
-			values: make([]any, 0, len(v)),
-		}
-		for key, value := range v {
-			m.keys = append(m.keys, key)
-			m.values = append(m.values, value)
-		}
+		n = len(v)
 	default:
 		return castError(reflect.TypeOf(val).String(), reflectTypeMap.String())
 	}
@@ -399,9 +392,10 @@ func setMap[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
 	// values for setList/setStruct: that intermediate representation
 	// allocates two objects per entry plus per-entry struct field-name
 	// lookups, which dominates the appender profile for rows with wide MAP
-	// columns. Iterate the OrderedMap's backing slices directly — the Keys()
-	// and Values() accessors return copies.
-	n := m.Len()
+	// columns. Both input types are iterated in place — Map directly (order
+	// stays Go-map-random, as before), OrderedMap via its backing slices (the
+	// Keys() and Values() accessors return copies) — so the map path itself
+	// allocates nothing.
 	childOffset := mapping.ListVectorGetSize(vec.vec)
 	listEntry := mapping.NewListEntry(uint64(childOffset), uint64(n))
 	setPrimitive(vec, rowIdx, listEntry)
@@ -417,15 +411,29 @@ func setMap[S any](vec *vector, rowIdx mapping.IdxT, val S) error {
 		return err
 	}
 
+	setEntry := func(entryIdx mapping.IdxT, key, value any) error {
+		if err := keyVec.setFn(keyVec, entryIdx, key); err != nil {
+			return err
+		}
+		return valueVec.setFn(valueVec, entryIdx, value)
+	}
+
 	entryIdx := childOffset
-	for i := range m.keys {
-		if err := keyVec.setFn(keyVec, entryIdx, m.keys[i]); err != nil {
-			return err
+	switch v := any(val).(type) {
+	case OrderedMap:
+		for i := range v.keys {
+			if err := setEntry(entryIdx, v.keys[i], v.values[i]); err != nil {
+				return err
+			}
+			entryIdx++
 		}
-		if err := valueVec.setFn(valueVec, entryIdx, m.values[i]); err != nil {
-			return err
+	case Map:
+		for key, value := range v {
+			if err := setEntry(entryIdx, key, value); err != nil {
+				return err
+			}
+			entryIdx++
 		}
-		entryIdx++
 	}
 	return nil
 }
